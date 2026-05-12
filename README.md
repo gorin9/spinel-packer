@@ -166,7 +166,7 @@ Spinel のライブラリエコシステムを **NPM 化させない** ため、
 良い例:
 - [`gorin9/spnl-web`](https://github.com/gorin9/spnl-web) — Web 開発に必要な 11 module を 1 repo に集約
   (date / logger / mime / session / csrf / multipart / scheduler / bcrypt / websocket / smtp / tls)
-- [`gorin9/-spnl-utils`](https://github.com/gorin9/-spnl-utils) — JSON / URL / Cookie / Router 等の汎用 util を集約 (7 modules)
+- [`gorin9/spnl-utils`](https://github.com/gorin9/spnl-utils) — JSON / URL / Cookie / Router 等の汎用 util を集約 (7 modules)
 
 理由:
 1. **Spinel の dead-code-elimination** が効くので、bundle しても未使用部分はバイナリに入らない (22KB 哲学を壊さない)
