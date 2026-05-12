@@ -157,6 +157,40 @@ SpnlWeb::JSON.encode({ x: 1 })
 
 トップレベル `class JSON` は他のライブラリと衝突するリスクが高い。
 
+## ライブラリ命名・粒度の指針 (推奨)
+
+Spinel のライブラリエコシステムを **NPM 化させない** ため、以下のガイドライン:
+
+### bundle 派 (推奨) — 関連機能を 1 repo にまとめる
+
+良い例:
+- [`gorin9/spnl-web`](https://github.com/gorin9/spnl-web) — Web 開発に必要な 11 module を 1 repo に集約
+  (date / logger / mime / session / csrf / multipart / scheduler / bcrypt / websocket / smtp / tls)
+- [`gorin9/-spnl-utils`](https://github.com/gorin9/-spnl-utils) — JSON / URL / Cookie / Router 等の汎用 util を集約 (7 modules)
+
+理由:
+1. **Spinel の dead-code-elimination** が効くので、bundle しても未使用部分はバイナリに入らない (22KB 哲学を壊さない)
+2. **NPM の left-pad 問題**を回避 (小粒すぎる lib 群 = dep hell)
+3. **「標準ライブラリが補充されるまでの暫定置き場」** という位置付けを明示できる
+   - matz が Spinel に json.rb を追加したら spnl-utils から削除すればよい
+4. **依存追加 1 回**で関連機能がまとめて入る (ergonomics)
+
+### 1 機能 1 repo 派 (非推奨)
+
+避けるべき例:
+- `gorin9/spnl-json`, `gorin9/spnl-url`, `gorin9/spnl-form`, ... (NPM 化)
+
+このスタイルは **避ける**:
+- repo 数が爆発、discovery 低下
+- 更新時に複数 repo 同時 push が必要
+- 利用者が「何を install すればいいか」分からなくなる
+
+### 1 repo の適切なサイズ
+
+- 関連する 5〜20 module
+- 1 つの「テーマ」(Web 開発 / 汎用 util / 暗号 / 数値計算 等) で括れる
+- 完全に独立した別領域 (例: TLS と SMTP) は別 repo
+
 ## 何をしないか (意図的)
 
 - ❌ **central registry** — GitHub URL で十分
