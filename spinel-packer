@@ -1,0 +1,383 @@
+#!/usr/bin/env ruby
+# spinel-packer — Spinel community packaging tool (v0.2)
+#
+# Subcommands:
+#   spinel-packer install <repo>[@<ref>]   # 新規依存追加 (Spinelfile + lock + fetch)
+#   spinel-packer install                   # Spinelfile.lock から厳密復元 (本番/CI)
+#   spinel-packer upgrade <repo>[@<ref>]   # 既存依存を更新 (Spinelfile sha + lock + re-fetch)
+#   spinel-packer lock                      # vendor/ → Spinelfile.lock 再生成
+#   spinel-packer check                     # Spinelfile.lock と vendor/ の一致検証 (CI 用)
+#   spinel-packer pack <entry.rb> [-o O]   # require_relative を再帰展開し単一 .rb
+#   spinel-packer version
+#
+# <repo> 表記:
+#   owner/repo          → https://github.com/owner/repo.git の shorthand
+#   github.com/owner/repo → 同上
+#   @<ref> 省略時は "main" を解決
+#   <ref> はブランチ名、タグ名、または 7+ 桁の SHA
+#
+# 仕様: docs/spec.md
+
+require "fileutils"
+require "digest"
+require "json"
+require "open3"
+require_relative "lib/spinel_manifest"
+
+VERSION = "0.2"
+
+# ---- 共通ヘルパー --------------------------------------------------------
+def run(*cmd)
+  out, err, status = Open3.capture3(*cmd)
+  abort "ERROR: #{cmd.join(' ')}\n#{err}" unless status.success?
+  out
+end
+
+# vendor/<name>/.spnl-source の sha 行を読む
+def git_sha_of(dir)
+  src = File.join(dir, ".spnl-source")
+  return nil unless File.exist?(src)
+  m = File.read(src).match(/^sha: (\w+)/)
+  m && m[1]
+end
+
+# vendor/<name>/ 内の全ファイルを SHA-256 で連結ハッシュ (.spnl-source 除く)
+def compute_tree_sha(path)
+  files = Dir.glob("#{path}/**/*").select { |p|
+    File.file?(p) && !p.end_with?(".spnl-source")
+  }.sort
+  hash = Digest::SHA256.new
+  files.each { |f| hash.update(File.read(f, mode: "rb")) }
+  hash.hexdigest
+end
+
+# vendor/ 配下の現状から lock 用の dep ハッシュ配列を生成
+def collect_lock_state
+  return [] unless File.directory?("vendor")
+  Dir.glob("vendor/*").select { |p| File.directory?(p) }.sort.map { |path|
+    name = File.basename(path).sub("__", "/")
+    src  = File.exist?(File.join(path, ".spnl-source")) ? File.read(File.join(path, ".spnl-source")) : ""
+    sha_m = src.match(/^sha: (\w+)/)
+    url_m = src.match(/^url: (.+)/)
+    files = Dir.glob("#{path}/**/*").select { |p| File.file?(p) && !p.end_with?(".spnl-source") }.sort
+    hash = Digest::SHA256.new
+    files.each { |f| hash.update(File.read(f, mode: "rb")) }
+    {
+      "name" => name,
+      "url"  => url_m && url_m[1].strip,
+      "sha"  => sha_m && sha_m[1],
+      "file_count" => files.length,
+      "tree_sha256" => hash.hexdigest,
+    }
+  }
+end
+
+# Spinelfile.lock を書き出し
+def write_lock_file
+  state = collect_lock_state
+  json = JSON.pretty_generate({
+    "spinel_pkg_spec" => SpinelManifest::SPEC_VERSION,
+    "generated_at"    => Time.now.utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "deps"            => state,
+  }) + "\n"
+  File.write("Spinelfile.lock", json)
+  state
+end
+
+# "owner/repo" / "github.com/owner/repo" / "...@<ref>" を解釈
+def parse_repo_spec(spec)
+  ref = "main"
+  if spec.include?("@")
+    spec, ref = spec.split("@", 2)
+  end
+  spec = spec.sub(/\.git\z/, "").sub(%r{\Ahttps?://}, "")
+  name = spec.start_with?("github.com/") ? spec.sub(%r{\Agithub\.com/}, "") : spec
+  abort "ERROR: cannot parse repo spec: '#{spec}' (expected owner/repo)" unless name.count("/") == 1
+  url = "https://github.com/#{name}.git"
+  [name, url, ref]
+end
+
+# ref (ブランチ名、タグ名、SHA) を URL 上の commit SHA に解決
+def resolve_sha(url, ref)
+  return ref if ref =~ /\A[0-9a-f]{40}\z/i   # 既にフル SHA
+  out, status = Open3.capture2("git", "ls-remote", url, ref)
+  abort "ls-remote failed: #{url} #{ref}" unless status.success?
+  line = out.lines.find { |l| !l.strip.empty? }
+  abort "no such ref '#{ref}' on #{url}" unless line
+  line.split.first
+end
+
+# 指定 url + sha で git clone → checkout → .git 削除 → .spnl-source 記録
+def fetch_to_vendor(name, url, sha)
+  dest = File.join("vendor", vendor_dir_for(name))
+  FileUtils.rm_rf(dest)
+  FileUtils.mkdir_p("vendor")
+  run("git", "clone", "--quiet", url, dest)
+  Dir.chdir(dest) { run("git", "checkout", "--quiet", sha) }
+  File.write(File.join(dest, ".spnl-source"),
+             "url: #{url}\nref: #{sha}\nsha: #{sha}\n")
+  FileUtils.rm_rf(File.join(dest, ".git"))
+  dest
+end
+
+# Spinelfile に use 行を追記 (存在チェック付き)
+def add_to_spinelfile(name, sha)
+  unless File.exist?("Spinelfile")
+    File.write("Spinelfile", %{spinel "0.1"\n\n})
+  end
+  content = File.read("Spinelfile")
+  if content =~ /^use\s+["']#{Regexp.escape(name)}["']/
+    abort "ERROR: #{name} は既に Spinelfile に存在。`upgrade` を使う"
+  end
+  content += "\n" unless content.end_with?("\n")
+  content += %{use "#{name}", sha: "#{sha}"\n}
+  File.write("Spinelfile", content)
+end
+
+# Spinelfile の既存 use 行の sha を更新
+def update_spinelfile_sha(name, new_sha)
+  abort "Spinelfile 無し" unless File.exist?("Spinelfile")
+  content = File.read("Spinelfile")
+  pat = /^use\s+["']#{Regexp.escape(name)}["'].*$/
+  abort "ERROR: #{name} は Spinelfile に存在しない。`install` を使う" unless content =~ pat
+  content = content.sub(pat, %{use "#{name}", sha: "#{new_sha}"})
+  File.write("Spinelfile", content)
+end
+
+# ---- subcommand: install ------------------------------------------------
+def cmd_install(args)
+  spec = args.find { |a| !a.start_with?("--") }
+  if spec.nil?
+    cmd_install_from_lock(args)
+  else
+    cmd_install_new(spec)
+  end
+end
+
+# install <repo>[@<ref>]: 新規依存追加
+def cmd_install_new(spec)
+  name, url, ref = parse_repo_spec(spec)
+  puts "  resolving #{name}@#{ref} ..."
+  sha = resolve_sha(url, ref)
+  puts "  resolved → #{sha.slice(0, 7)}"
+  add_to_spinelfile(name, sha)
+  dest = fetch_to_vendor(name, url, sha)
+  files = Dir.glob("#{dest}/**/*").count { |p| File.file?(p) }
+  puts "  fetched #{name} into #{dest} (#{files} files)"
+  write_lock_file
+  puts "  Spinelfile + Spinelfile.lock updated"
+  puts "done."
+end
+
+# install (引数なし): Spinelfile.lock から厳密復元
+def cmd_install_from_lock(args)
+  if File.exist?("Spinelfile.lock")
+    install_strict_from_lock
+  elsif File.exist?("Spinelfile")
+    install_loose_from_spinelfile
+  else
+    abort "ERROR: Spinelfile も Spinelfile.lock も無い"
+  end
+end
+
+def install_strict_from_lock
+  lock = JSON.parse(File.read("Spinelfile.lock"))
+  FileUtils.mkdir_p("vendor")
+  lock["deps"].each do |dep|
+    name = dep["name"]
+    sha  = dep["sha"]
+    url  = dep["url"]
+    expected_tree = dep["tree_sha256"]
+    dest = File.join("vendor", vendor_dir_for(name))
+
+    if File.directory?(dest) && git_sha_of(dest) == sha && compute_tree_sha(dest) == expected_tree
+      puts "  ✓ #{name} @ #{sha.slice(0, 7)} (cached, tree verified)"
+      next
+    end
+
+    puts "  → #{name} @ #{sha.slice(0, 7)} ..."
+    fetch_to_vendor(name, url, sha)
+
+    actual = compute_tree_sha(dest)
+    if actual != expected_tree
+      abort <<~ERR
+        ERROR: #{name} tree_sha256 mismatch.
+          expected: #{expected_tree}
+          actual:   #{actual}
+          (Spinelfile.lock または依存 repo が改変されている可能性)
+      ERR
+    end
+    puts "    ok (tree verified)"
+  end
+  puts "done."
+end
+
+def install_loose_from_spinelfile
+  manifest = SpinelManifest.load
+  if manifest.deps.empty?
+    puts "Spinelfile に依存無し"
+    return
+  end
+  FileUtils.mkdir_p("vendor")
+  manifest.deps.each do |dep|
+    ref = dep[:sha] || dep[:tag] || dep[:branch] || "main"
+    sha = dep[:sha] || resolve_sha(dep[:url], ref)
+    puts "  → #{dep[:name]} @ #{sha.slice(0, 7)} ..."
+    fetch_to_vendor(dep[:name], dep[:url], sha)
+    files = Dir.glob("vendor/#{vendor_dir_for(dep[:name])}/**/*").count { |p| File.file?(p) }
+    puts "    ok (#{files} files)"
+  end
+  write_lock_file
+  puts "done. (Spinelfile.lock generated)"
+end
+
+# ---- subcommand: upgrade ------------------------------------------------
+def cmd_upgrade(args)
+  spec = args.find { |a| !a.start_with?("--") }
+  abort "usage: spinel-packer upgrade <repo>[@<ref>]" unless spec
+  name, url, ref = parse_repo_spec(spec)
+  abort "Spinelfile 無し" unless File.exist?("Spinelfile")
+  abort "ERROR: #{name} は Spinelfile に存在しない。`install` を使う" unless File.read("Spinelfile") =~ /^use\s+["']#{Regexp.escape(name)}["']/
+  puts "  resolving #{name}@#{ref} ..."
+  sha = resolve_sha(url, ref)
+  puts "  resolved → #{sha.slice(0, 7)}"
+  update_spinelfile_sha(name, sha)
+  fetch_to_vendor(name, url, sha)
+  write_lock_file
+  puts "  Spinelfile + Spinelfile.lock updated"
+  puts "done."
+end
+
+# ---- subcommand: lock ---------------------------------------------------
+def cmd_lock(args)
+  stdout_only = args.include?("--stdout")
+  abort "vendor/ 無し" unless File.directory?("vendor")
+  state = collect_lock_state
+  json = JSON.pretty_generate({
+    "spinel_pkg_spec" => SpinelManifest::SPEC_VERSION,
+    "generated_at"    => Time.now.utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "deps"            => state,
+  }) + "\n"
+  if stdout_only
+    puts json
+  else
+    File.write("Spinelfile.lock", json)
+    puts "Spinelfile.lock 出力 (#{state.length} deps)"
+    state.each do |d|
+      sha  = (d["sha"]  || "?").slice(0, 7)
+      tree = d["tree_sha256"].slice(0, 12)
+      puts "  #{d['name']} #{sha}  files=#{d['file_count']}  tree=#{tree}..."
+    end
+  end
+end
+
+# ---- subcommand: check (lock vs vendor/) --------------------------------
+def cmd_check(args)
+  abort "Spinelfile.lock 無し" unless File.exist?("Spinelfile.lock")
+  abort "vendor/ 無し" unless File.directory?("vendor")
+  expected = JSON.parse(File.read("Spinelfile.lock"))["deps"].sort_by { |d| d["name"] }
+  current  = collect_lock_state.sort_by { |d| d["name"] }
+  if expected == current
+    puts "OK: vendor/ は Spinelfile.lock と一致 (#{current.length} deps)"
+  else
+    warn "DRIFT: vendor/ が Spinelfile.lock と一致しない"
+    puts "--- expected ---"
+    expected.each { |d| puts "  #{d['name']} #{d['sha']&.slice(0,7)} tree=#{d['tree_sha256']&.slice(0,12)}" }
+    puts "--- actual ---"
+    current.each  { |d| puts "  #{d['name']} #{d['sha']&.slice(0,7)} tree=#{d['tree_sha256']&.slice(0,12)}" }
+    exit 1
+  end
+end
+
+# ---- subcommand: pack ---------------------------------------------------
+@packed = {}
+
+def inline_requires(abs_path, out)
+  return if @packed[abs_path]
+  @packed[abs_path] = true
+  src = File.read(abs_path)
+  base = File.dirname(abs_path)
+  out << "# === #{abs_path} ===\n"
+  src.each_line do |line|
+    if line =~ /\A\s*require_relative\s+["']([^"']+)["']/
+      rel = $1
+      rel += ".rb" unless rel.end_with?(".rb")
+      sub = File.expand_path(rel, base)
+      if File.exist?(sub)
+        out << "# require_relative #{rel.inspect} → inlined below\n"
+        inline_requires(sub, out)
+      else
+        out << "# require_relative #{rel.inspect}  (NOT FOUND, skipped)\n"
+      end
+    else
+      out << line
+    end
+  end
+end
+
+def cmd_pack(args)
+  entry = nil
+  output = nil
+  i = 0
+  while i < args.length
+    case args[i]
+    when "-o"
+      i += 1
+      output = args[i]
+    when /\A-/
+      abort "unknown flag: #{args[i]}"
+    else
+      entry ||= args[i]
+    end
+    i += 1
+  end
+  abort "usage: spinel-packer pack <entry.rb> [-o OUT]" unless entry
+  abort "entry not found: #{entry}" unless File.exist?(entry)
+  io = output ? File.open(output, "w") : $stdout
+  io << "# Generated by spinel-packer v#{VERSION} from #{entry}\n"
+  io << "# at #{Time.now.utc.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+  inline_requires(File.expand_path(entry), io)
+  io.close if output
+end
+
+# ---- usage --------------------------------------------------------------
+USAGE = <<~USAGE
+  spinel-packer v#{VERSION} — Spinel community packaging tool
+
+  Subcommands:
+    install <repo>[@<ref>]   新規依存を追加 (Spinelfile + lock + fetch)
+    install                  Spinelfile.lock から厳密復元 (本番/CI)
+    upgrade <repo>[@<ref>]   既存依存を更新
+    lock                     vendor/ → Spinelfile.lock 再生成
+    check                    Spinelfile.lock と vendor/ の一致検証 (drift で exit 1)
+    pack <entry.rb> [-o O]   require_relative を再帰展開し単一 .rb 化
+    version
+
+  <repo> 表記:
+    owner/repo               → https://github.com/owner/repo.git
+    github.com/owner/repo    → 同上
+    @<ref> 省略時は "main" を使用 (タグ名・SHA 指定可)
+
+  Spinelfile 例:
+    spinel "0.1"
+    use "gorin9/spnl-web", sha: "49cd5ebf..."
+
+  Spinelfile.lock とは?
+    vendor/ の現状スナップショット (各依存の SHA + ファイル内容 hash)。
+    install (引数なし) で読み込まれ、check で改ざん検出。
+    git commit すれば「いつ何のバージョンを使ってたか」が監査可能。
+
+  仕様: docs/spec.md
+USAGE
+
+case ARGV[0]
+when "install" then cmd_install(ARGV[1..-1] || [])
+when "upgrade" then cmd_upgrade(ARGV[1..-1] || [])
+when "lock"    then cmd_lock(ARGV[1..-1] || [])
+when "check"   then cmd_check(ARGV[1..-1] || [])
+when "pack"    then cmd_pack(ARGV[1..-1] || [])
+when "version", "--version", "-v"
+  puts "spinel-packer #{VERSION}"
+else
+  puts USAGE
+end
