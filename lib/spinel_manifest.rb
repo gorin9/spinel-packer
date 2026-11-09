@@ -8,7 +8,7 @@
 #   use "git+http://tatami.internal/git/foo.git", sha: "..."
 
 class SpinelManifest
-  SPEC_VERSION = "0.1"
+  SPEC_VERSION = "0.2"
 
   attr_reader :deps
 

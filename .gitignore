@@ -2,3 +2,10 @@
 *.bak
 /tmp/
 /test-vendor/
+
+/build/
+/vendor/
+/.bundle/
+/*.gem
+/Gemfile.lock
+/spin.lock

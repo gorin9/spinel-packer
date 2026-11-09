@@ -22,9 +22,11 @@ require "fileutils"
 require "digest"
 require "json"
 require "open3"
+require "ripper"
+require "tmpdir"
 require_relative "lib/spinel_manifest"
 
-VERSION = "0.2"
+VERSION = "0.3.0"
 
 # ---- 共通ヘルパー --------------------------------------------------------
 def run(*cmd)
@@ -42,41 +44,36 @@ def git_sha_of(dir)
 end
 
 # vendor/<name>/ 内の全ファイルを SHA-256 で連結ハッシュ (.spnl-source 除く)
+def tree_entries(path)
+  Dir.glob(File.join(path, '**', '*'), File::FNM_DOTMATCH).reject { |p| ['.', '..', '.spnl-source'].include?(File.basename(p)) || File.directory?(p) && !File.symlink?(p) }.sort
+end
+
 def compute_tree_sha(path)
-  files = Dir.glob("#{path}/**/*").select { |p|
-    File.file?(p) && !p.end_with?(".spnl-source")
-  }.sort
   hash = Digest::SHA256.new
-  files.each { |f| hash.update(File.read(f, mode: "rb")) }
+  tree_entries(path).each do |file|
+    stat = File.lstat(file)
+    rel = file.delete_prefix(path.sub(%r{/$}, '') + '/')
+    kind = stat.symlink? ? 'symlink' : 'file'
+    content = stat.symlink? ? File.readlink(file) : File.binread(file)
+    [rel, kind, (stat.mode & 0o777).to_s, content].each { |field| hash.update([field.bytesize].pack('Q>')); hash.update(field) }
+  end
   hash.hexdigest
 end
 
-# vendor/ 配下の現状から lock 用の dep ハッシュ配列を生成
 def collect_lock_state
-  return [] unless File.directory?("vendor")
-  Dir.glob("vendor/*").select { |p| File.directory?(p) }.sort.map { |path|
-    name = File.basename(path).sub("__", "/")
-    src  = File.exist?(File.join(path, ".spnl-source")) ? File.read(File.join(path, ".spnl-source")) : ""
-    sha_m = src.match(/^sha: (\w+)/)
-    url_m = src.match(/^url: (.+)/)
-    files = Dir.glob("#{path}/**/*").select { |p| File.file?(p) && !p.end_with?(".spnl-source") }.sort
-    hash = Digest::SHA256.new
-    files.each { |f| hash.update(File.read(f, mode: "rb")) }
-    {
-      "name" => name,
-      "url"  => url_m && url_m[1].strip,
-      "sha"  => sha_m && sha_m[1],
-      "file_count" => files.length,
-      "tree_sha256" => hash.hexdigest,
-    }
-  }
+  return [] unless File.directory?('vendor')
+  Dir.glob('vendor/*').select { |p| File.directory?(p) }.sort.map do |path|
+    source = File.exist?(File.join(path, '.spnl-source')) ? File.read(File.join(path, '.spnl-source')) : ''
+    { 'name' => File.basename(path).sub('__','/'), 'url' => source[/^url: (.+)/,1], 'sha' => source[/^sha: (\w+)/,1], 'file_count' => tree_entries(path).length, 'tree_sha256' => compute_tree_sha(path) }
+  end
 end
 
 # Spinelfile.lock を書き出し
 def write_lock_file
   state = collect_lock_state
   json = JSON.pretty_generate({
-    "spinel_pkg_spec" => SpinelManifest::SPEC_VERSION,
+    "spinel_pkg_spec" => "0.2",
+    "tree_hash_format" => "path-kind-mode-length-v2",
     "generated_at"    => Time.now.utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
     "deps"            => state,
   }) + "\n"
@@ -109,14 +106,19 @@ end
 
 # 指定 url + sha で git clone → checkout → .git 削除 → .spnl-source 記録
 def fetch_to_vendor(name, url, sha)
-  dest = File.join("vendor", vendor_dir_for(name))
-  FileUtils.rm_rf(dest)
-  FileUtils.mkdir_p("vendor")
-  run("git", "clone", "--quiet", url, dest)
-  Dir.chdir(dest) { run("git", "checkout", "--quiet", sha) }
-  File.write(File.join(dest, ".spnl-source"),
-             "url: #{url}\nref: #{sha}\nsha: #{sha}\n")
-  FileUtils.rm_rf(File.join(dest, ".git"))
+  abort 'invalid dependency name' unless name.match?(/\A[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\z/)
+  abort 'expected full commit SHA' unless sha.match?(/\A[0-9a-f]{40}\z/i)
+  dest = File.join('vendor', vendor_dir_for(name))
+  FileUtils.mkdir_p('vendor')
+  Dir.mktmpdir('.spnl-fetch-', 'vendor') do |scratch|
+    tree = File.join(scratch, 'tree')
+    run('git', 'clone', '--quiet', '--', url, tree)
+    Dir.chdir(tree) { run('git', 'checkout', '--quiet', sha) }
+    File.write(File.join(tree, '.spnl-source'), "url: #{url}\nref: #{sha}\nsha: #{sha}\n")
+    FileUtils.rm_rf(File.join(tree, '.git'))
+    FileUtils.rm_rf(dest)
+    FileUtils.mv(tree, dest)
+  end
   dest
 end
 
@@ -160,8 +162,11 @@ def cmd_install_new(spec)
   puts "  resolving #{name}@#{ref} ..."
   sha = resolve_sha(url, ref)
   puts "  resolved → #{sha.slice(0, 7)}"
-  add_to_spinelfile(name, sha)
+  if File.exist?('Spinelfile') && File.read('Spinelfile').match?(/^use\s+["']#{Regexp.escape(name)}["']/)
+    abort 'Dependency already exists; use upgrade'
+  end
   dest = fetch_to_vendor(name, url, sha)
+  add_to_spinelfile(name, sha)
   files = Dir.glob("#{dest}/**/*").count { |p| File.file?(p) }
   puts "  fetched #{name} into #{dest} (#{files} files)"
   write_lock_file
@@ -182,6 +187,11 @@ end
 
 def install_strict_from_lock
   lock = JSON.parse(File.read("Spinelfile.lock"))
+  abort "Legacy content-only lock: run migrate for spin, or regenerate with lock after reviewing sources" unless lock["tree_hash_format"] == "path-kind-mode-length-v2"
+  manifest = SpinelManifest.load
+  declared = manifest.deps.map { |d| [d[:name], d[:sha]] }.sort
+  pinned = lock.fetch("deps").map { |d| [d.fetch("name"), d.fetch("sha")] }.sort
+  abort "Spinelfile and lock differ" unless declared == pinned
   FileUtils.mkdir_p("vendor")
   lock["deps"].each do |dep|
     name = dep["name"]
@@ -241,8 +251,8 @@ def cmd_upgrade(args)
   puts "  resolving #{name}@#{ref} ..."
   sha = resolve_sha(url, ref)
   puts "  resolved → #{sha.slice(0, 7)}"
-  update_spinelfile_sha(name, sha)
   fetch_to_vendor(name, url, sha)
+  update_spinelfile_sha(name, sha)
   write_lock_file
   puts "  Spinelfile + Spinelfile.lock updated"
   puts "done."
@@ -254,7 +264,8 @@ def cmd_lock(args)
   abort "vendor/ 無し" unless File.directory?("vendor")
   state = collect_lock_state
   json = JSON.pretty_generate({
-    "spinel_pkg_spec" => SpinelManifest::SPEC_VERSION,
+    "spinel_pkg_spec" => "0.2",
+    "tree_hash_format" => "path-kind-mode-length-v2",
     "generated_at"    => Time.now.utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
     "deps"            => state,
   }) + "\n"
@@ -298,8 +309,10 @@ def inline_requires(abs_path, out)
   src = File.read(abs_path)
   base = File.dirname(abs_path)
   out << "# === #{abs_path} ===\n"
-  src.each_line do |line|
-    if line =~ /\A\s*require_relative\s+["']([^"']+)["']/
+  tokens = Ripper.lex(src)
+  require_lines = tokens.select { |pos, kind, text, _| kind == :on_ident && text == "require_relative" }.map { |pos, *_| pos[0] }
+  src.each_line.with_index(1) do |line, line_number|
+    if require_lines.include?(line_number) && line =~ /\A\s*require_relative\s+["']([^"']+)["']\s*(?:#.*)?$/
       rel = $1
       rel += ".rb" unless rel.end_with?(".rb")
       sub = File.expand_path(rel, base)
@@ -307,7 +320,7 @@ def inline_requires(abs_path, out)
         out << "# require_relative #{rel.inspect} → inlined below\n"
         inline_requires(sub, out)
       else
-        out << "# require_relative #{rel.inspect}  (NOT FOUND, skipped)\n"
+        raise LoadError, "missing require_relative #{rel.inspect} in #{abs_path}"
       end
     else
       out << line
@@ -340,11 +353,35 @@ def cmd_pack(args)
   io.close if output
 end
 
+
+def cmd_migrate(args)
+  require 'ripper'
+  path = args[0] || 'Spinelfile'
+  text = File.read(path)
+  deps = []
+  # Deliberately accept only the historical one-line, pinned literal format.
+  text.each_line do |line|
+    line = line.strip
+    next if line.empty? || line.start_with?('#') || line.match?(/\Aspinel\s+["']0\.[12]["']\s*\z/)
+    match = line.match(/\Ause\s+["']([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)["'],\s*sha:\s*["']([0-9a-f]{40})["']\s*\z/)
+    abort "Cannot migrate executable/unpinned manifest line: #{line}" unless match
+    deps << [match[1], match[2]]
+  end
+  abort 'spin.toml exists; merge dependencies explicitly' if File.exist?('spin.toml')
+  names = deps.map { |name,_| name.split('/').last.tr('-', '_') }
+  abort 'Dependency names collide' unless names.uniq.length == names.length
+  lines = ['# Migrated by spinel-packer. Run spin lock, then review spin.lock.', '[dependencies]']
+  deps.each { |name,sha| lines << "#{name.split('/').last.tr('-', '_')} = { git = #{("https://github.com/"+name+".git").inspect}, ref = #{sha.inspect} }" }
+  File.write('spin.toml', lines.join("\n")+"\n")
+  puts 'Wrote spin.toml with pinned Git refs. Run spin lock and replace vendor require_relative paths with package entry points.'
+end
+
 # ---- usage --------------------------------------------------------------
 USAGE = <<~USAGE
   spinel-packer v#{VERSION} — Spinel community packaging tool
 
   Subcommands:
+    migrate [Spinelfile]     generate official spin.toml (pinned literals only)
     install <repo>[@<ref>]   新規依存を追加 (Spinelfile + lock + fetch)
     install                  Spinelfile.lock から厳密復元 (本番/CI)
     upgrade <repo>[@<ref>]   既存依存を更新
@@ -371,6 +408,7 @@ USAGE = <<~USAGE
 USAGE
 
 case ARGV[0]
+when "migrate" then cmd_migrate(ARGV[1..-1] || [])
 when "install" then cmd_install(ARGV[1..-1] || [])
 when "upgrade" then cmd_upgrade(ARGV[1..-1] || [])
 when "lock"    then cmd_lock(ARGV[1..-1] || [])
