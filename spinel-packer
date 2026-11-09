@@ -367,13 +367,19 @@ def cmd_migrate(args)
     abort "Cannot migrate executable/unpinned manifest line: #{line}" unless match
     deps << [match[1], match[2]]
   end
-  abort 'spin.toml exists; merge dependencies explicitly' if File.exist?('spin.toml')
+  abort 'spin.toml or spin.lock exists; merge dependencies explicitly' if File.exist?('spin.toml') || File.exist?('spin.lock')
   names = deps.map { |name,_| name.split('/').last.tr('-', '_') }
   abort 'Dependency names collide' unless names.uniq.length == names.length
   lines = ['# Migrated by spinel-packer. Run spin lock, then review spin.lock.', '[dependencies]']
-  deps.each { |name,sha| lines << "#{name.split('/').last.tr('-', '_')} = { git = #{("https://github.com/"+name+".git").inspect}, ref = #{sha.inspect} }" }
+  deps.each { |name,sha| lines << "#{name.split('/').last.tr('-', '_')} = { git = #{("https://github.com/"+name+".git").inspect} }" }
+  lock = '# Migrated commit pins; spin lock fills the package versions.' + "\n"
+  deps.each do |name,sha|
+    key = name.split('/').last.tr('-', '_')
+    lock += "\n[lock.#{key}]\nversion = \"0.0.0\"\ngit = #{('https://github.com/'+name+'.git').inspect}\nref = #{sha.inspect}\n"
+  end
   File.write('spin.toml', lines.join("\n")+"\n")
-  puts 'Wrote spin.toml with pinned Git refs. Run spin lock and replace vendor require_relative paths with package entry points.'
+  File.write('spin.lock', lock)
+  puts 'Wrote spin.toml and spin.lock with pinned commits. Run spin lock and replace vendor require_relative paths with package entry points.'
 end
 
 # ---- usage --------------------------------------------------------------

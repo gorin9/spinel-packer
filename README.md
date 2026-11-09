@@ -11,7 +11,9 @@ spin lock
 
 Migration accepts only pinned, literal `use "owner/repo", sha: "<40 hex>"` declarations.
 It never executes a Spinelfile, never overwrites spin.toml, and rejects executable or
-unpinned input for explicit review. It preserves Git SHAs, not the old vendor layout.
+unpinned input for explicit review. It preserves Git SHAs in spin.lock, not the old vendor layout. Initial package versions
+are 0.0.0 until spin lock verifies the source and fills its real version. Full SHA
+values are not passed as clone --branch refs (unsupported on the baseline).
 
 Legacy install/upgrade/lock/check remain available. New locks use spec 0.2 and
 `path-kind-mode-length-v2`: paths, entry type, permissions, file boundaries, symlink

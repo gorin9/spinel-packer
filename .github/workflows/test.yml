@@ -16,3 +16,19 @@ jobs:
       - run: gem install rake --no-document
       - run: rake test
       - run: gem build spinel-packer.gemspec
+  official-spin-migration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+      - run: sudo apt-get update && sudo apt-get install -y build-essential
+      - run: gem install prism -v 1.9.0 --no-document
+      - uses: actions/checkout@v4
+        with:
+          repository: matz/spinel
+          ref: '2026.10.25'
+          path: .compiler
+      - run: make -C .compiler deps && make -C .compiler -j2
+      - run: SPIN_PROGRAM="$GITHUB_WORKSPACE/.compiler/bin/spin" ruby test/test_packer.rb
